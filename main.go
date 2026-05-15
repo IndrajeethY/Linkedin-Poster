@@ -7,8 +7,7 @@ import (
 
 func main() {
 	if err := bot.LoadConfig(); err != nil {
-		log.Fatalf("Failed to load config: %v", err)
-		return
+		log.Fatalf("config: %v", err)
 	}
 	bot.InitTgBot()
 }

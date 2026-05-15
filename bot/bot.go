@@ -12,264 +12,420 @@ import (
 	"github.com/PaulSonOfLars/gotgbot/v2/ext"
 	"github.com/PaulSonOfLars/gotgbot/v2/ext/handlers"
 	"github.com/PaulSonOfLars/gotgbot/v2/ext/handlers/filters/callbackquery"
+	"github.com/google/generative-ai-go/genai"
 )
 
 type PostData struct {
-	Prompt  string
-	PhotoID string
-	Image   string
+	Prompt    string
+	Text      string
+	PhotoID   string
+	ImagePath string
 }
 
 var postStore sync.Map
+var chatSessions sync.Map // chatID -> []*genai.Content
 
 func InitTgBot() {
 	b, err := gotgbot.NewBot(config.BotToken, nil)
 	if err != nil {
 		log.Fatalf("failed to create bot: %v", err)
 	}
+
 	dispatcher := ext.NewDispatcher(&ext.DispatcherOpts{
 		Error: func(b *gotgbot.Bot, ctx *ext.Context, err error) ext.DispatcherAction {
-			log.Println("an error occurred while handling update:", err.Error())
+			log.Printf("handler error: %v", err)
 			return ext.DispatcherActionNoop
 		},
 		MaxRoutines: ext.DefaultMaxRoutines,
 	})
 	updater := ext.NewUpdater(dispatcher, nil)
-	dispatcher.AddHandler(handlers.NewCommand("start", start))
-	dispatcher.AddHandler(handlers.NewCommand("genpost", genpost))
-	dispatcher.AddHandler(handlers.NewCommand("post", post))
-	dispatcher.AddHandler(handlers.NewCommand("help", help))
-	dispatcher.AddHandler(handlers.NewCommand("ai", geminiai))
-	dispatcher.AddHandler(handlers.NewCallback(callbackquery.Prefix("proceed."), proceedcbk))
-	dispatcher.AddHandler(handlers.NewCallback(callbackquery.Prefix("post."), postcbk))
+
+	dispatcher.AddHandler(handlers.NewCommand("start", startCmd))
+	dispatcher.AddHandler(handlers.NewCommand("help", helpCmd))
+	dispatcher.AddHandler(handlers.NewCommand("id", idCmd))
+	dispatcher.AddHandler(handlers.NewCommand("ai", aiCmd))
+	dispatcher.AddHandler(handlers.NewCommand("chat", chatCmd))
+	dispatcher.AddHandler(handlers.NewCommand("clear", clearCmd))
+	dispatcher.AddHandler(handlers.NewCommand("genpost", genpostCmd))
+	dispatcher.AddHandler(handlers.NewCommand("topic", topicCmd))
+	dispatcher.AddHandler(handlers.NewCommand("post", postCmd))
+	dispatcher.AddHandler(handlers.NewCallback(callbackquery.Prefix("regen."), regenCallback))
+	dispatcher.AddHandler(handlers.NewCallback(callbackquery.Prefix("post."), postCallback))
+
 	err = updater.StartPolling(b, &ext.PollingOpts{
 		DropPendingUpdates: true,
 		GetUpdatesOpts: &gotgbot.GetUpdatesOpts{
 			Timeout: 9,
 			RequestOpts: &gotgbot.RequestOpts{
-				Timeout: time.Second * 10,
+				Timeout: 10 * time.Second,
 			},
 		},
 	})
 	if err != nil {
-		panic("failed to start polling: " + err.Error())
+		log.Fatalf("failed to start polling: %v", err)
 	}
-	log.Printf("%s has been started...\n", b.User.Username)
+	log.Printf("%s started", b.User.Username)
 	updater.Idle()
 }
 
-func start(b *gotgbot.Bot, ctx *ext.Context) error {
-	_, err := ctx.EffectiveMessage.Reply(b, fmt.Sprintf("Hey there, I'm %s! I can help you post to LinkedIn and process text with Gemini AI.", b.User.Username), &gotgbot.SendMessageOpts{
-		ParseMode: "HTML",
-	})
+func isOwner(ctx *ext.Context) bool {
+	return ctx.EffectiveSender.Id() == config.OwnerID
+}
+
+func startCmd(b *gotgbot.Bot, ctx *ext.Context) error {
+	text := fmt.Sprintf("Hey! I'm %s — I generate and post LinkedIn content using AI.\n\nUse /help to see available commands.", b.User.Username)
+	_, err := ctx.EffectiveMessage.Reply(b, text, nil)
 	return err
 }
 
-func help(b *gotgbot.Bot, ctx *ext.Context) error {
-	_, err := ctx.EffectiveMessage.Reply(b, fmt.Sprintf("Hey there, I'm %s! I can help you post to LinkedIn and process text with Gemini AI.\n\nCommands:\n/genpost - Generate post\n/post - Post to LinkedIn\n/ai - Process text with Gemini AI", b.User.Username), &gotgbot.SendMessageOpts{
-		ParseMode: "HTML",
-	})
+func helpCmd(b *gotgbot.Bot, ctx *ext.Context) error {
+	text := `<b>Commands</b>
+
+<b>AI Chat (with tools)</b>
+/chat <code>&lt;message&gt;</code> — Chat with AI assistant that can fetch repos, read URLs, and post to LinkedIn
+/clear — Reset chat history
+
+<b>Quick Post Generation</b>
+/genpost <code>&lt;github_repo_url&gt;</code> — Generate a LinkedIn post from a GitHub repo
+/topic <code>&lt;topic&gt;</code> — Generate a LinkedIn post about any topic
+
+<b>Direct Actions</b>
+/post <code>&lt;text&gt;</code> — Post text directly to LinkedIn (reply to a photo to include it)
+/ai <code>&lt;prompt&gt;</code> — Ask Gemini AI anything (no tools)
+/id — Show your Telegram user ID`
+	_, err := ctx.EffectiveMessage.Reply(b, text, &gotgbot.SendMessageOpts{ParseMode: "HTML"})
 	return err
 }
 
-func geminiai(b *gotgbot.Bot, ctx *ext.Context) error {
+func idCmd(b *gotgbot.Bot, ctx *ext.Context) error {
+	_, err := ctx.EffectiveMessage.Reply(b, fmt.Sprintf("Your Telegram ID: <code>%d</code>", ctx.EffectiveSender.Id()), &gotgbot.SendMessageOpts{ParseMode: "HTML"})
+	return err
+}
+
+func aiCmd(b *gotgbot.Bot, ctx *ext.Context) error {
 	msg := ctx.EffectiveMessage
-	args := ctx.Args()
-	if ctx.EffectiveSender.Id() != config.OwnerID {
-		_, err := msg.Reply(b, "You are not authorized to use this command", nil)
+	if !isOwner(ctx) {
+		_, err := msg.Reply(b, "Not authorized.", nil)
 		return err
 	}
-	query := strings.Join(args[1:], " ")
 
+	query := strings.Join(ctx.Args()[1:], " ")
 	if query == "" {
-		_, err := msg.Reply(b, "Send text to process", nil)
+		_, err := msg.Reply(b, "Usage: /ai &lt;prompt&gt;", &gotgbot.SendMessageOpts{ParseMode: "HTML"})
 		return err
 	}
 
-	airesponse, err := ProcessGemini(query)
+	response, err := ProcessGemini(query)
 	if err != nil {
-		_, err := msg.Reply(b, fmt.Sprintf("Failed to process text: %v", err), nil)
+		_, err := msg.Reply(b, fmt.Sprintf("Gemini error: %v", err), nil)
 		return err
 	}
 
-	_, err = msg.Reply(b, airesponse, nil)
+	if len(response) > 4096 {
+		response = response[:4080] + "\n\n... (truncated)"
+	}
+	_, err = msg.Reply(b, response, nil)
 	return err
 }
 
-func genpost(b *gotgbot.Bot, ctx *ext.Context) error {
+func chatCmd(b *gotgbot.Bot, ctx *ext.Context) error {
 	msg := ctx.EffectiveMessage
-	args := ctx.Args()
-	if ctx.EffectiveSender.Id() != config.OwnerID {
-		_, err := msg.Reply(b, "You are not authorized to use this command", nil)
+	if !isOwner(ctx) {
+		_, err := msg.Reply(b, "Not authorized.", nil)
 		return err
 	}
-	query := strings.Join(args[1:], " ")
 
+	query := strings.Join(ctx.Args()[1:], " ")
 	if query == "" {
-		_, err := msg.Reply(b, "Send repo URL", nil)
+		_, err := msg.Reply(b, "Usage: /chat &lt;message&gt;\n\nExamples:\n• /chat write a post about my WiseHosting project on github.com/Wisehosting1/WiseHosting\n• /chat what repos does IndrajeethY have on GitHub?\n• /chat write a post about microservices vs monoliths", &gotgbot.SendMessageOpts{ParseMode: "HTML"})
 		return err
+	}
+
+	chatID := fmt.Sprintf("%d", msg.Chat.Id)
+	var history []*genai.Content
+
+	if raw, ok := chatSessions.Load(chatID); ok {
+		history = raw.([]*genai.Content)
+	}
+
+	history = append(history, &genai.Content{
+		Role:  "user",
+		Parts: []genai.Part{genai.Text(query)},
+	})
+
+	waiting, _ := msg.Reply(b, "Thinking...", nil)
+
+	response, newHistory, err := ProcessGeminiWithTools(history)
+	if err != nil {
+		waiting.EditText(b, fmt.Sprintf("Error: %v", err), nil)
+		return nil
+	}
+
+	chatSessions.Store(chatID, newHistory)
+
+	if len(response) > 4096 {
+		response = response[:4080] + "\n\n... (truncated)"
+	}
+	waiting.EditText(b, response, nil)
+	return nil
+}
+
+func clearCmd(b *gotgbot.Bot, ctx *ext.Context) error {
+	chatID := fmt.Sprintf("%d", ctx.EffectiveMessage.Chat.Id)
+	chatSessions.Delete(chatID)
+	_, err := ctx.EffectiveMessage.Reply(b, "Chat history cleared.", nil)
+	return err
+}
+
+func genpostCmd(b *gotgbot.Bot, ctx *ext.Context) error {
+	msg := ctx.EffectiveMessage
+	if !isOwner(ctx) {
+		_, err := msg.Reply(b, "Not authorized.", nil)
+		return err
+	}
+
+	repoURL := strings.Join(ctx.Args()[1:], " ")
+	if repoURL == "" {
+		_, err := msg.Reply(b, "Usage: /genpost &lt;github_repo_url&gt;", &gotgbot.SendMessageOpts{ParseMode: "HTML"})
+		return err
+	}
+
+	waiting, _ := msg.Reply(b, "Fetching repo and generating post...", nil)
+
+	prompt, err := GenRepoPrompt(repoURL)
+	if err != nil {
+		waiting.EditText(b, fmt.Sprintf("Failed to fetch repo: %v", err), nil)
+		return nil
 	}
 
 	var photoID, imagePath string
 	if msg.ReplyToMessage != nil && len(msg.ReplyToMessage.Photo) > 0 {
 		photoID = msg.ReplyToMessage.Photo[len(msg.ReplyToMessage.Photo)-1].FileId
-		file, err := b.GetFile(photoID, nil)
-		if err != nil {
-			return err
-		}
-		imagePath, err = DownloadFile(file.URL(b, nil))
-		if err != nil {
-			return err
+		file, ferr := b.GetFile(photoID, nil)
+		if ferr == nil {
+			imagePath, _ = DownloadFile(file.URL(b, nil))
 		}
 	}
 
-	uniqueID := fmt.Sprintf("%d", time.Now().UnixNano())
-	prompt := GenPrompt(query)
-	postStore.Store(uniqueID, PostData{
-		Prompt:  prompt,
-		PhotoID: photoID,
-		Image:   imagePath,
+	text, err := ProcessGemini(prompt)
+	if err != nil {
+		waiting.EditText(b, fmt.Sprintf("Gemini error: %v", err), nil)
+		return nil
+	}
+
+	id := fmt.Sprintf("%d", time.Now().UnixNano())
+	postStore.Store(id, PostData{
+		Prompt:    prompt,
+		Text:      text,
+		PhotoID:   photoID,
+		ImagePath: imagePath,
 	})
 
-	_, err := msg.Reply(b, prompt, &gotgbot.SendMessageOpts{
+	if len(text) > 4096 {
+		text = text[:4080] + "\n\n... (truncated)"
+	}
+	waiting.EditText(b, text, &gotgbot.EditMessageTextOpts{
 		ReplyMarkup: gotgbot.InlineKeyboardMarkup{
-			InlineKeyboard: [][]gotgbot.InlineKeyboardButton{{
-				{Text: "Proceed", CallbackData: "proceed." + uniqueID},
-			}},
+			InlineKeyboard: [][]gotgbot.InlineKeyboardButton{
+				{
+					{Text: "Regenerate", CallbackData: "regen." + id},
+					{Text: "Post to LinkedIn", CallbackData: "post." + id},
+				},
+			},
 		},
 	})
-	return err
+	return nil
 }
 
-func post(b *gotgbot.Bot, ctx *ext.Context) error {
+func topicCmd(b *gotgbot.Bot, ctx *ext.Context) error {
 	msg := ctx.EffectiveMessage
-	text := strings.Join(ctx.Args()[1:], " ")
-	if ctx.EffectiveSender.Id() != config.OwnerID {
-		_, err := msg.Reply(b, "You are not authorized to use this command", nil)
+	if !isOwner(ctx) {
+		_, err := msg.Reply(b, "Not authorized.", nil)
 		return err
 	}
-	if msg.ReplyToMessage != nil && msg.ReplyToMessage.Text != "" {
+
+	topic := strings.Join(ctx.Args()[1:], " ")
+	if topic == "" {
+		_, err := msg.Reply(b, "Usage: /topic &lt;topic&gt;", &gotgbot.SendMessageOpts{ParseMode: "HTML"})
+		return err
+	}
+
+	waiting, _ := msg.Reply(b, "Generating post...", nil)
+
+	var photoID, imagePath string
+	if msg.ReplyToMessage != nil && len(msg.ReplyToMessage.Photo) > 0 {
+		photoID = msg.ReplyToMessage.Photo[len(msg.ReplyToMessage.Photo)-1].FileId
+		file, ferr := b.GetFile(photoID, nil)
+		if ferr == nil {
+			imagePath, _ = DownloadFile(file.URL(b, nil))
+		}
+	}
+
+	prompt := GenTopicPrompt(topic)
+	text, err := ProcessGemini(prompt)
+	if err != nil {
+		waiting.EditText(b, fmt.Sprintf("Gemini error: %v", err), nil)
+		return nil
+	}
+
+	id := fmt.Sprintf("%d", time.Now().UnixNano())
+	postStore.Store(id, PostData{
+		Prompt:    prompt,
+		Text:      text,
+		PhotoID:   photoID,
+		ImagePath: imagePath,
+	})
+
+	if len(text) > 4096 {
+		text = text[:4080] + "\n\n... (truncated)"
+	}
+	waiting.EditText(b, text, &gotgbot.EditMessageTextOpts{
+		ReplyMarkup: gotgbot.InlineKeyboardMarkup{
+			InlineKeyboard: [][]gotgbot.InlineKeyboardButton{
+				{
+					{Text: "Regenerate", CallbackData: "regen." + id},
+					{Text: "Post to LinkedIn", CallbackData: "post." + id},
+				},
+			},
+		},
+	})
+	return nil
+}
+
+func postCmd(b *gotgbot.Bot, ctx *ext.Context) error {
+	msg := ctx.EffectiveMessage
+	if !isOwner(ctx) {
+		_, err := msg.Reply(b, "Not authorized.", nil)
+		return err
+	}
+
+	text := strings.Join(ctx.Args()[1:], " ")
+
+	if text == "" && msg.ReplyToMessage != nil && msg.ReplyToMessage.Text != "" {
 		text = msg.ReplyToMessage.Text
 	}
-	var photoID, imagePath string
-	if len(msg.ReplyToMessage.Photo) > 0 {
-		photoID = msg.ReplyToMessage.Photo[len(msg.ReplyToMessage.Photo)-1].FileId
-		file, err := b.GetFile(photoID, nil)
-		if err != nil {
-			return err
-		}
-		imagePath, err = DownloadFile(file.URL(b, nil))
-		if err != nil {
-			return err
+	if text == "" {
+		_, err := msg.Reply(b, "Usage: /post &lt;text&gt; or reply to a message with /post", &gotgbot.SendMessageOpts{ParseMode: "HTML"})
+		return err
+	}
+
+	var imagePath string
+	if msg.ReplyToMessage != nil && len(msg.ReplyToMessage.Photo) > 0 {
+		photoID := msg.ReplyToMessage.Photo[len(msg.ReplyToMessage.Photo)-1].FileId
+		file, ferr := b.GetFile(photoID, nil)
+		if ferr == nil {
+			imagePath, _ = DownloadFile(file.URL(b, nil))
 		}
 	}
+
+	var link string
+	var postErr error
 
 	if imagePath != "" {
-		uploadUrl, asset, err := RegisterImageUpload()
-		if err != nil {
-			return err
-		}
 		defer os.Remove(imagePath)
-		err = UploadImage(uploadUrl, imagePath)
+		uploadURL, imageURN, err := InitializeImageUpload()
 		if err != nil {
+			_, err := msg.Reply(b, fmt.Sprintf("Image upload init failed: %v", err), nil)
 			return err
 		}
-		link, err := PostToLinkedInWithImage(text, asset)
-		if err != nil {
+		if err := UploadImage(uploadURL, imagePath); err != nil {
+			_, err := msg.Reply(b, fmt.Sprintf("Image upload failed: %v", err), nil)
 			return err
 		}
-		_, err = msg.Reply(b, fmt.Sprintf("Posted to LinkedIn: %s", link), nil)
-		return err
+		link, postErr = PostToLinkedInWithImage(text, imageURN)
 	} else {
-		link, err := PostToLinkedIn(text)
-		if err != nil {
-			return err
-		}
-		_, err = msg.Reply(b, fmt.Sprintf("Posted to LinkedIn: %s", link), nil)
+		link, postErr = PostToLinkedIn(text)
+	}
+
+	if postErr != nil {
+		_, err := msg.Reply(b, fmt.Sprintf("Failed to post: %v", postErr), nil)
 		return err
 	}
+
+	_, err := msg.Reply(b, fmt.Sprintf("Posted to LinkedIn!\n%s", link), nil)
+	return err
 }
 
-func proceedcbk(b *gotgbot.Bot, ctx *ext.Context) error {
+func regenCallback(b *gotgbot.Bot, ctx *ext.Context) error {
 	query := ctx.Update.CallbackQuery
-	args := strings.Split(query.Data, ".")
-	uniqueID := args[1]
+	id := strings.TrimPrefix(query.Data, "regen.")
 
-	rawData, ok := postStore.Load(uniqueID)
+	rawData, ok := postStore.Load(id)
 	if !ok {
-		_, _, err := query.Message.EditText(b, "Expired", nil)
-		return err
+		query.Answer(b, &gotgbot.AnswerCallbackQueryOpts{Text: "Session expired"})
+		return nil
 	}
 
-	postData := rawData.(PostData)
-	query.Answer(b, &gotgbot.AnswerCallbackQueryOpts{Text: "Generating post...", ShowAlert: true})
-	airesponse, err := ProcessGemini(postData.Prompt)
+	query.Answer(b, &gotgbot.AnswerCallbackQueryOpts{Text: "Regenerating..."})
+
+	data := rawData.(PostData)
+	text, err := ProcessGemini(data.Prompt)
 	if err != nil {
-		return err
+		query.Message.EditText(b, fmt.Sprintf("Gemini error: %v", err), nil)
+		return nil
 	}
 
-	postStore.Store(uniqueID, PostData{
-		Prompt:  airesponse,
-		PhotoID: postData.PhotoID,
-		Image:   postData.Image,
-	})
+	data.Text = text
+	postStore.Store(id, data)
 
-	_, _, err = query.Message.EditText(b, airesponse, &gotgbot.EditMessageTextOpts{
+	if len(text) > 4096 {
+		text = text[:4080] + "\n\n... (truncated)"
+	}
+	query.Message.EditText(b, text, &gotgbot.EditMessageTextOpts{
 		ReplyMarkup: gotgbot.InlineKeyboardMarkup{
-			InlineKeyboard: [][]gotgbot.InlineKeyboardButton{{
-				{Text: "Post to LinkedIn", CallbackData: "post." + uniqueID},
-			}},
+			InlineKeyboard: [][]gotgbot.InlineKeyboardButton{
+				{
+					{Text: "Regenerate", CallbackData: "regen." + id},
+					{Text: "Post to LinkedIn", CallbackData: "post." + id},
+				},
+			},
 		},
 	})
-	return err
+	return nil
 }
 
-func postcbk(b *gotgbot.Bot, ctx *ext.Context) error {
+func postCallback(b *gotgbot.Bot, ctx *ext.Context) error {
 	query := ctx.Update.CallbackQuery
-	args := strings.Split(query.Data, ".")
-	uniqueID := args[1]
+	id := strings.TrimPrefix(query.Data, "post.")
 
-	rawData, ok := postStore.LoadAndDelete(uniqueID)
+	rawData, ok := postStore.LoadAndDelete(id)
 	if !ok {
-		_, _, err := query.Message.EditText(b, "Expired", nil)
-		return err
+		query.Answer(b, &gotgbot.AnswerCallbackQueryOpts{Text: "Session expired"})
+		return nil
 	}
 
-	postData := rawData.(PostData)
+	data := rawData.(PostData)
 	var link string
-	var err error
-	if postData.Image != "" {
-		uploadUrl, asset, err := RegisterImageUpload()
-		if err != nil {
-			_, _, err := query.Message.EditText(b, fmt.Sprintf("Failed to upload image: %v", err), nil)
-			return err
-		}
+	var postErr error
 
-		err = UploadImage(uploadUrl, postData.Image)
-		defer os.Remove(postData.Image)
+	if data.ImagePath != "" {
+		defer os.Remove(data.ImagePath)
+		uploadURL, imageURN, err := InitializeImageUpload()
 		if err != nil {
-			_, _, err := query.Message.EditText(b, fmt.Sprintf("Failed to upload image: %v", err), nil)
-			return err
+			query.Message.EditText(b, fmt.Sprintf("Image upload failed: %v", err), nil)
+			return nil
 		}
-
-		link, err = PostToLinkedInWithImage(postData.Prompt, asset)
-		if err != nil {
-			_, _, err := query.Message.EditText(b, fmt.Sprintf("Failed to post to LinkedIn: %v", err), nil)
-			return err
+		if err := UploadImage(uploadURL, data.ImagePath); err != nil {
+			query.Message.EditText(b, fmt.Sprintf("Image upload failed: %v", err), nil)
+			return nil
 		}
+		link, postErr = PostToLinkedInWithImage(data.Text, imageURN)
 	} else {
-		link, err = PostToLinkedIn(postData.Prompt)
-		if err != nil {
-			_, _, err := query.Message.EditText(b, fmt.Sprintf("Failed to post to LinkedIn: %v", err), nil)
-			return err
-		}
+		link, postErr = PostToLinkedIn(data.Text)
 	}
 
-	query.Answer(b, &gotgbot.AnswerCallbackQueryOpts{Text: "Posted to LinkedIn", ShowAlert: true})
-	_, _, err = query.Message.EditReplyMarkup(b, &gotgbot.EditMessageReplyMarkupOpts{ReplyMarkup: gotgbot.InlineKeyboardMarkup{
-		InlineKeyboard: [][]gotgbot.InlineKeyboardButton{{
-			{Text: "Link", Url: link},
-		}},
-	}})
-	return err
+	if postErr != nil {
+		query.Message.EditText(b, fmt.Sprintf("Failed to post: %v", postErr), nil)
+		return nil
+	}
+
+	query.Answer(b, &gotgbot.AnswerCallbackQueryOpts{Text: "Posted!", ShowAlert: true})
+	query.Message.EditText(b, data.Text, &gotgbot.EditMessageTextOpts{
+		ReplyMarkup: gotgbot.InlineKeyboardMarkup{
+			InlineKeyboard: [][]gotgbot.InlineKeyboardButton{
+				{{Text: "View Post", Url: link}},
+			},
+		},
+	})
+	return nil
 }

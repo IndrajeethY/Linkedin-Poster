@@ -1,30 +1,11 @@
-# Use the official Go image as the base image
-FROM golang:1.20-alpine
-
-# Set the working directory inside the container
-WORKDIR /app
-
-# Copy the Go module files first to download dependencies
+FROM golang:1.23-alpine AS build
+WORKDIR /src
 COPY go.mod go.sum ./
-
-# Download all dependencies
 RUN go mod download
-
-# Copy the rest of the application code
 COPY . .
+RUN CGO_ENABLED=0 go build -o /bin/linkedin-poster .
 
-# Build the Go application
-RUN go build -o Linkedin-Poster .
-
-# Expose port (if necessary, depending on how your bot communicates)
-# EXPOSE 8080
-
-# Set environment variables (you can override these when running the container)
-ENV BOT_TOKEN=<your-telegram-bot-token>
-ENV LINKEDIN_CLIENT_ID=<your-linkedin-client-id>
-ENV LINKEDIN_CLIENT_SECRET=<your-linkedin-client-secret>
-ENV LINKEDIN_ACCESS_TOKEN=<linkedin-access-token>
-ENV GEMINI_API_KEY=<your-gemini-api-key>
-
-# Run the application
-CMD ["./telegram-linkedin-bot"]
+FROM alpine:3.20
+RUN apk add --no-cache ca-certificates
+COPY --from=build /bin/linkedin-poster /usr/local/bin/linkedin-poster
+ENTRYPOINT ["linkedin-poster"]
