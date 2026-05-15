@@ -11,7 +11,7 @@ import (
 
 const (
 	linkedInBaseURL = "https://api.linkedin.com"
-	linkedInVersion = "202401"
+	linkedInVersion = "202601"
 )
 
 func setLinkedInHeaders(req *http.Request) {
